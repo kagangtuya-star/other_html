@@ -2,6 +2,10 @@
 
 第7、8章，11章，15章
 
+[TOC]
+
+
+
 ## 第七章 进程的环境
 
 ### C语言程序/进程的一生
@@ -1080,7 +1084,7 @@ int pthread_detach(pthread_t tid);
 
 **返回值**
 
-- 成功：返回 0
+- 成功：返回 0 
 - 失败：返回错误码
 
 一旦对子线程调用了`pthread_detach`，就无法对子线程调用`pthread_join`了。
@@ -1090,3 +1094,497 @@ int pthread_detach(pthread_t tid);
 任何子线程可以取消主线程。此时一旦取消主线程，则进程立即结束。
 
 ## 线程同步
+
+当多个线程共享相同的内存时，必须确保每个线程看到一致的数据视图。
+
+- 如果每个线程使用的变量都是其他线程不会读取和修改的，则不会存在数据一致性问题
+
+- 如果变量是只读的，多个线程同时读取改变了也不会有数据一致性问题	
+
+- 若一个线程可以修改的变量，其他线程也可以读取或者修改的时候，我们就需要对这些线程进行同步，确保他们在访问变量的存储内容时不会访问到无效的值
+
+  > 当一个线程修改变量时，其他线程在读取这个变量时可能会看到一个不一致的值。当变量修改的时间多于一个存储器反问周期的处理器结构中，当存储器读和存储器写这两个周期交叉时，这种不一致就会出现。这就是由于计算机体系结构引起的不一致。
+
+- 除了计算机体系结构外，程序使用变量的方式也会引起竞争。如加1然后判断是否大于0。在加1和判断之间的组合并非原子操作，这就为不一致的出现提供了可能。  
+
+如果变量只被一个线程读取，没有被其他线程修改，则不会有数据一致性问题。如果变量被多个线程读取或者修改，就需要对这些线程进行同步，确保访问变量时不会出现不一致的情况。为了解决这个问题，线程需要在访问数据前加锁，访问结束后解锁，保证同一时间只有一个线程能够访问数据。
+
+所以，线程不得不在访问数据前加锁并在访问结束后解锁，使得同一时间只允许一个线程访问被锁住的变数据。
+
+### 互斥量`mutex` （锁）
+
+#### 为什么要用互斥量
+
+可以使用`pthread`的互斥接口来保护数据，确保同一时刻只有一个线程访问数据。互斥量`mutex` 本质上是一把锁，在访问共享资源前对互斥量进行设置（加锁），在访问完成后释放互斥量（解锁）
+
+任何其他试图再次对互斥量进行加锁的线程都会被阻塞，直到当前线程解锁该互斥量
+
+**如果解锁互斥量时有一个以上的线程阻塞，那么等待锁住该互斥量的阻塞线程都变成可运行状态**
+
+- 第一个变成运行状态的线程就可以对互斥量进行加锁
+- 其他线程看到互斥量仍然是锁住的，只能回去再次等待它重新变为可用
+
+因此，每次只有一个线程是可以向前执行的。
+
+只有将所有线程都设计成遵守使用互斥量进行访问，互斥机制才能正常工作，这个工作需要编程实现。
+
+#### 互斥量的使用、赋予与销毁——`pthread_mutex_init` /`pthread_mutex_destroy`函数
+
+互斥量是用`pthread_mutex_t`数据类型表示的，使用互斥量之前必须初始化。
+
+如果是动态分配的互斥量（如通过`malloc`函数），则必须调用`pthread_mutex_init`函数进行初始化。
+
+如果是静态分配的互斥量，那么除了调用`pthread_mutex_init`函数来初始化，也可以将它设置为常量`PTHREAD_MUTEX_INITALIZER`来初始化。
+
+```
+#include<pthread.h>
+int pthread_mutex_init(pthread_mutex_t *restrict mutex,
+	const pthread_mutexattr_t *restrict attr);
+int pthread_mutex_destroy(pthread_mutex_t *mutex);
+```
+
+**参数**
+
+`mutex`：待初始化/释放的互斥量的地址
+
+`attr`：互斥量的属性，如果为`NULL`，那么互斥量设置为默认属性
+
+**返回值**
+
+- 成功：返回0
+- 失败： 返回错误编号
+
+互斥量的加锁/解锁操作——`pthread_mutex_lock/pthread_mutex_trylock/pthread_mutex_unlock`函数
+
+```
+#include<pthread.h>
+int pthread_mutex_lock(pthread_mutex_t *mutex);
+int pthread_mutex_trylock(pthread_mutex_t *mutex);
+int pthread_mutex_unlock(pthread_mutex_t *mutex);
+```
+
+**参数**
+
+`mutex`：待加锁/解锁互斥量的地址
+
+**返回值**
+
+- 成功：返回0
+- 失败： 返回错误编号
+
+**说明**
+
+`pthread_mutex_lock`用于对互斥量进行加锁。如果互斥量已经上锁，则调用线程将阻塞直到互斥量解锁
+
+`pthread_mutex_trylock`也用于对互斥量进行加锁
+
+- 如果它被调用时，互斥量处于未锁定状态，那么函数将锁住互斥量并返回0
+- 如果它被调用时，互斥量处于锁定状态，则函数调用失败，立即返回`EBUSY`而不是阻塞。
+
+`pthread_mutex_unlock`用于对互斥量进行解锁。
+
+### 死锁与避免死锁
+
+两种情况可能导致死锁。
+
+- 如果线程试图对同一个互斥量加锁两次，则它自身就会陷入死锁状态。
+- 假设有两个线程`T1`和`T2`，它们需要同时使用两个共享资源`A`和`B`。如果`T1`先锁住`A`，然后`T2`先锁住`B`，此时`T1`想要锁住`B`，但是`B`已经被`T2`锁住了，`T1`会被阻塞等待B的解锁，而`T2`又想要锁住`A`，但是`A`已经被`T1`锁住了，`T2`也会被阻塞等待`A`的解锁。这种情况就是死锁，两个线程都无法继续执行下去。（即为咬住自己尾巴的蛇）
+
+一般可以通过仔细控制互斥量加锁的顺序来避免死锁的发生。
+
+**为了避免死锁，可以规定所有线程必须按照相同的顺序锁住共享资源A和B。**例如，所有线程必须先锁住A再锁住B，或者先锁住B再锁住A，这样就可以避免死锁的发生。
+
+还有一种办法是使用`pthread_mutex_trylock`接口并执行多次测试。一旦多次试图锁住互斥量都失败，则立即释放自己锁定的互斥量。
+
+#### 对互斥量加锁或等待指定时间后释放——`pthread_mutex_trylock`接口
+
+```
+#include<pthread.h>
+#include<time.h>
+int pthread_mutex_timedlock(pthread_mutex_t *restrict mutex,
+	const struct timespec *restrict tsptr);
+```
+
+**参数**
+
+- `mutex`：指向互斥量对象的指针，用于加锁互斥量。
+- `tsptr`：指向一个`timespec`结构体的指针，指定了等待互斥量的最长时间。（并不是相对时间，比如10秒）
+
+**返回值**
+
+- 若成功锁住互斥量，则返回0；
+- 若在指定时间内无法锁住互斥量，则返回`ETIMEDOUT`错误代码；
+- 其他错误返回值包括`EINTR`（被信号中断）和`EINVAL`（`tsptr`参数包含无效值）。
+
+**说明**
+
+`pthread_mutex_timedlock`被调用时，如果互斥量处于未锁定状态，那么函数将锁住互斥量并返回0，如果互斥量处于锁定状态，那么函数将阻塞到`tsptr`指定的时刻。在到达超时时刻时，`pthread_mutex_timedlock`不再试图对互斥量进行加锁，而是返回错误码`ETIMEOUT`
+
+额外的，可以使用`clock_gettime`函数获取`timespec`结构表示的当前时间。但是目前并不是所有平台都支持这个函数。因此也可以用`gettimeofday`函数获取`timeval`结构表示的当前时间，然后将这个时间转换为`timespec`结构。
+
+### 提供更高并行性的读写锁
+
+#### 读写锁的概念
+
+读写锁与互斥量类似，不过读写锁允许更高的并行性。
+
+互斥量要么是锁住状态，要么是不加锁状态，而且一次只有一个线程可以对其进行加锁。
+
+而读写锁可以有三种状态：
+
+- 读模式下加锁状态（读锁定）
+- 写模式下加锁状态（写锁定）
+- 不加锁状态（未锁定）
+
+#### 写锁、读锁与线程的关系
+
+一次只能有**一个线程**可以对读写锁加**写锁**，但是允许**多个线程**同时对读写锁加**读锁**。
+
+- 当读写锁是写锁定状态时，在该锁被解锁之前，所有试图对这个锁加锁（无论是加读锁还是价写锁）的线程都会被阻塞。
+- 当读写锁是读锁定状态时，所有试图对它加读锁的线程都可以获得访问权，但是所有试图对它加写锁的线程都会被阻塞。
+
+*假设有一个读写锁，并且已经有一个线程T1获取了读锁，此时另一个线程T2想要获取写锁，但是读写锁已经被T1锁住了，所以T2必须等待T1释放读锁。如果此时还有其他线程T3、T4等想要获取读锁，那么它们也必须等待T2获取写锁并释放后才能获取读锁。*
+
+*如果不阻塞后续的加读锁请求，那么在T2释放写锁之前，可能会有一些读请求不断到来。由于读写锁处于读锁定状态，这些读请求都会被立即满足。如果这种情况持续下去，那么T2永远无法获取写锁，因为总有一些读请求在不断到来。因此，为了避免这种情况的发生，当有一个线程试图对读写锁加写锁时，读写锁会阻塞之后任何线程的所有加读锁请求，直到该写锁被释放。*
+
+#### 读写锁的用处
+
+读写锁非常适合对于数据结构读的次数远大于写的情况。**读写锁也叫共享互斥锁**
+
+- 当读写锁是读锁定时，称它以共享模式锁住的
+- 当读写锁是写锁定时，称它以互斥模式锁住的
+
+#### 读写锁的初始化与销毁——`pthread_rwlock_init/pthread_rwlock_destroy`函数
+
+同样的，使用读写锁之前必须初始化。
+
+读写锁用`pthread_rwlock_t`数据类型表示。如果是动态分配的读写锁（如通过`malloc`函数），则必须调用`pthread_rwlock_init`函数进行初始化；如果是静态分配的读写锁，那么除了调用`pthread_rwlock_init`函数来初始化，也可以将它设置为常量`PTHREAD_RWLOCK_INITALIZER`来初始化。
+
+此外，如果是动态分配的读写锁，那么在`free`释放内存之前必须调用`pthread_rwlock_destroy`函数来销毁读写锁。该函数会释放在动态初始化读写锁时动态分配的资源。
+
+函数如下
+
+```
+#include<pthread.h>
+int pthread_rwlock_init(pthread_rwlock_t *restrict rwlock,
+	const pthread_rwlockattr_t *restrict attr);
+int pthread_rwlock_destroy(pthread_rwlock_t *rwlock);
+```
+
+**参数**
+
+- `rwlock`：待初始化/销毁的读写锁的地址
+- `attr`：读写锁的属性。如果为`NULL`，那么读写锁设置为默认属性
+
+返回值：
+
+- 成功：返回0
+- 失败： 返回错误编号
+
+#### 对读写锁加锁/解锁操作——`pthread_rwlock_rdlock/pthread_rwlock_wrlock/pthread_rwlock_unlock`函数
+
+```
+#include<pthread.h>
+int pthread_rwlock_rdlock(pthread_rwlock_t *rwlock);
+int pthread_rwlock_wrlock(pthread_rwlock_t *rwlock);
+int pthread_rwlock_unlock(pthread_rwlock_t *rwlock);
+```
+
+**参数**
+
+`rwlock`：待加锁/解锁的读写锁的地址
+
+**返回值**
+
+- 成功：返回0
+- 失败： 返回错误编号
+
+**说明**
+
+`pthread_rwlock_rdlock`用于对读写锁加读锁。如果读写锁当前是未加锁的，或者是读锁定的，则加锁成功；如果读写锁当前是写锁定的，则阻塞线程。
+
+`pthread_rwlock_wrlock`用于对读写锁加写锁。如果读写锁当前是未加锁的，则加锁成功；如果读写锁当前是读锁定或者写锁定的，则阻塞线程。
+
+`pthread_rwlock_unlock`用于对读写锁进行解锁，无论读写锁当前状态是处于读锁定还是写锁定。
+
+不过，有的系统对读写锁同时加读锁的数量有限制，并不能无限制的加读锁。
+
+#### 有条件的对读写锁加锁——`pthread_rwlock_tryrdlock/pthread_rwlock_trywrlock`函数
+
+```
+#include<pthread.h>
+int pthread_rwlock_tryrdlock(pthread_rwlock_t *rwlock);
+int pthread_rwlock_trywrlock(pthread_rwlock_t *rwlock);
+```
+
+**参数**
+
+`rwlock`：待加锁的读写锁的地址
+
+**返回值**
+
+- 成功：返回0
+- 失败： 不能加锁时，返回错误`EBUSY`而不是阻塞线程。
+
+#### 对读写锁加锁的超时版本——`pthread_rwlock_timedrdlock/pthread_rwlock_timedwrlock`函数
+
+```
+#include<pthread.h>
+#include<time.h>
+int pthread_rwlock_timedrdlock(pthread_rwlock_t *rwlock,
+	const struct timespect*restrict tsptr);
+int pthread_rwlock_timedwrlock(pthread_rwlock_t *rwlock,
+	const struct timespect*restrict tsptr);
+```
+
+**参数**
+
+`rwlock`：待加锁的读写锁的地址
+
+`tsptr`：指向一个`timespec`的指针，该`timepsec`指定了一个绝对时间（并不是相对时间，比如10秒）
+
+**返回值**
+
+- 成功：允许加锁，那么函数将对读写锁加锁并返回0
+- 失败： 不允许加锁，那么函数将阻塞到`tsptr`指定的时刻。在到达超时时刻时，`pthread_mutex_timedlock`不再试图对读写锁进行加锁，而是返回错误码`ETIMEOUT`。
+
+### 多个线程进行会谈——使用`条件变量`进行同步
+
+条件变量是线程可用的另一种同步机制。条件变量给多个线程提供了一个会合的场所。
+
+条件变量实际应用中，它映射到某个数据的真假，如判断缓冲区的长度不为零：`buffer_len!=0`
+
+条件变量与互斥量一起使用时，允许线程以无竞争的方式等待特定的条件发生。
+
+条件本身是由互斥量来进行保护的：（例如缓冲区`buffer`的访问需要互斥量保护）
+
+- 线程在改变条件的状态之前必须首先锁住互斥量，如要修改`buffer`或者`buffer_len`
+- 其他线程在获得互斥量之前不会察觉这种改变，因为必须首先锁定互斥量之后才能计算`buffer_len`
+
+#### 条件变量的初始化与销毁——`pthread_cond_init/pthread_cond_destroy`函数
+
+条件变量是用`pthread_cond_t`数据类型表示，使用条件变量之前必须初始化。
+
+- 如果是动态分配的条件变量（如通过`malloc`函数），则必须调用`pthread_cond_init`函数进行初始化，且在`free`释放内存之前必须调用`pthread_cond_destroy`函数来销毁条件变量。该函数会释放在动态初始化条件变量时动态分配的资源。
+
+- 如果是静态分配的条件变量，那么除了调用`pthread_cond_init`函数来初始化，也可以将它设置为常量`PTHREAD_COND_INITALIZER`来初始化
+
+```
+#include<pthread.h>
+int pthread_cond_init(pthread_cond_t *restrict cond,
+	const pthread_condattr_t *restrict attr);
+int pthread_cond_destroy(pthread_cond_t *cond);
+```
+
+参数
+
+`cond`：待初始化/销毁的条件变量的地址
+
+`attr`：条件变量的属性，如果为`NULL`，那么条件变量设置为默认属性
+
+返回值
+
+- 成功：返回0
+- 失败： 返回错误编码
+
+#### 等待条件成立与等待超时——`pthread_cond_wait/pthread_cond_timedwait`函数
+
+```
+#include<pthread.h>
+#include<time.h>
+int pthread_cond_wait(pthread_cond_t *restrict cond,
+	pthread_mutext_t *restrict mutex);
+int pthread_cond_timedwait(pthread_cond_t *restrict cond,
+	pthread_mutext_t *restrict mutex,
+	const struct timespect*restrict tsptr);
+```
+
+**参数**
+
+`cond`：要等待的条件变量的地址
+
+`mutex`：与条件变量配套的互斥量的地址
+
+`tsptr`：指向一个`timespec`的指针，该`timepsec`指定了一个绝对时间（并不是相对时间，比如10秒）
+
+**返回值**
+
+- 成功：指定条件成立，那么函数返回0
+- 失败：指定条件不成立，那么函数将阻塞到`tsptr`指定的时刻。在到达超时时刻时，`pthread_mutex_timedlock`返回错误码`ETIMEOUT`。
+
+`pthread_cond_wait`等待指定指定的条件成立；如果指定的条件不成立，则线程阻塞。`pthread_cond_timedwait`会指定一个超时时刻。如果在超时时刻到来时，指定条件仍然不满足，则函数返回错误码`ETIMEOUT`
+
+需要用互斥量`mutex`用于对条件变量`cond`进行保护。调用者在调用`pthread_cond_wait/pthread_cond_timedwait`函数之前，必须首先对`mutex`加锁（即`mutex`此时必须是处于已锁定状态，因为这里有“计算条件然后如果不满足条件就把进程投入休眠”的操作，这两步并不是原子的，所以需要利用条件变量保护起来）。
+
+`pthread_cond_wait/pthread_cond_timedwait`会计算指定的条件是否成立，如果不成立则会自动把调用线程放到等待条件的线程列表中并阻塞线程，然后对互斥量`mutex`进行解锁。
+
+当从`pthread_cond_wait/pthread_cond_timedwait`函数返回时，返回之前互斥量`mutex`再次被锁住。
+
+#### 通知所有线程某个条件成立——`pthread_cond_signal/pthread_cond_broadcast`函数
+
+```
+#include<pthread.h>
+int pthread_cond_signal(pthread_cond_t *cond);
+int pthread_cond_broadcast(pthread_cond_t *cond);
+```
+
+**参数**
+
+`cond`：该指针指向的条件变量状态变为：条件成立
+
+**返回值**
+
+- 成功：返回0
+- 失败： 返回错误编号
+
+`pthread_cond_signal`函数能够唤醒一个等待`cond`条件发生的线程，`pthread_cond_broadcast`函数能够唤醒等待`cond`条件发生的所有线程。
+
+#### 总结
+
+条件变量通常用于通知其它线程：某个条件成立。条件变量本身只是一个标记，真正发生改变的是某个真实等待同步的数据。举例如下：
+
+- 线程`A`负责从网络接口读取网络数据，然后存入缓冲区中
+- 线程`B`负责`GUI`，并且当用户点击某个按钮时，打印缓冲区中的网络数据。
+
+这种情况必须用多线程。如果是单线程，则当线程`A`读取网络数据时，可能发生阻塞。此时导致用户界面失去响应，用户体验极差。一旦使用多线程时，则必须有某种通信机制，使得当线程`B`打印网络数据时，确保缓冲区中有数据。改进流程为：
+
+- 线程`B`等待条件变量`cond`的发生，然后投入睡眠
+- 线程`A`读取网络数据，一旦读取成功，则通知线程`A`，`cond`条件成立
+- 线程`B`被唤醒，继续执行打印网络数据的工作
+
+这里真实的条件是：缓冲区中有了有效的数据，而`cond`条件变量只是真实条件的一个标记，不是数据。
+
+### 忙起来的——自旋锁
+
+#### 概念
+
+自旋锁与互斥量类似，但是它并不是通过睡眠使得线程阻塞，而是在获得锁之前一直处于忙等（自旋）阻塞状态，此时`CPU`不能做其他的事情。
+
+*假设你在一个餐厅排队等待就餐，但是你的朋友还没来，你不想让别人占用你和你朋友的位置。于是你选择采用自旋锁的方式来保护你们的位置。*
+
+*首先，你会先取一个号码牌，这个号码牌类似于自旋锁的标志位。然后你将号牌放置在桌子上占据位置。如果你的朋友没有到达，你不用担心有人占据你的位置，也就是获取了自旋锁；如果你的朋友到了，你取下那号牌可以吃饭了，也就是释放了自旋锁。*
+
+*这个例子中，自旋锁就是号码牌，自旋就是号牌放在桌子上没法被占位 ，获取自旋锁就是把号牌放在桌子上，释放自旋锁就是可以吃饭了。*
+
+**自旋锁常用于以下情况：锁被持有时间很短，而且线程不希望在重新调度上花费太多的成本。**
+
+自旋锁通常作为底层原语用于实现其他类型的锁。
+
+自旋锁用于非抢占式内核中时非常有用。但是在用户层，自旋锁并不是非常有用（除了运行在不允许抢占的实时调度操作系统中）
+
+自旋锁的接口与互斥量的接口类似，这使得它们之间可以方便的替换。
+
+#### 自旋锁的初始化与销毁——`pthread_spin_init/pthread_spin_destroy函数`
+
+**参数**
+
+`lock`：待初始化/释放的自旋锁的地址
+
+`pshared`：自旋锁的属性。
+
+- `PTHREAD_PROCESS_SHARED`：表示自旋锁能够跨进程使用
+- `PTHREAD_PROCESS_PRIVATE`：表示自旋锁只能在进程内部的线程中使用
+
+**返回值**
+
+- 成功：返回0
+- 失败： 返回错误编号
+
+#### 对自旋锁加锁/解锁操作——`pthread_spin_lock/pthread_spin_trylock/pthread_spin_unlock`函数
+
+```
+#include<pthread.h>
+int pthread_spin_lock(pthread_spinlock_t *lock);
+int pthread_spin_trylock(pthread_spinlock_t *lock);
+int pthread_spin_unlock(pthread_spinlock_t *lock);
+```
+
+**参数**
+
+`lock`：待加锁/解锁的自旋锁的地址
+
+**返回值**
+
+- 成功：返回0
+- 失败： 返回错误编号
+
+**说明**
+
+`pthread_spin_lock`用于对自旋锁进行加锁。如果自旋锁已经上锁，则调用线程自旋
+
+`pthread_spin_unlock`用于对自旋锁进行解锁
+
+`pthread_spin_trylock`也用于对自旋锁进行加锁，如果它被调用时，自旋锁处于未锁定状态，那么函数将锁住自旋锁并返回 0；自旋锁处于锁定状态，则函数调用失败，立即返回`EBUSY`。
+
+同一个线程连续对自旋锁进行加锁，结构未定义。可能第二次加锁会返回`EDEADLK`错误或其他错误，也可能永久自旋
+
+试图对未加锁的自旋锁进行解锁，结果也未定义。
+
+不要在持有自旋锁的情况下调用可能使线程休眠的函数。如果持有自旋锁的线程休眠，会浪费CPU资源，因为其他线程需要获取自旋锁要等待的时间就延长了。
+
+自旋锁的接口与用法基本与互斥量相同
+
+- 如果不加锁，子线程之间相互竞争。最终主线程得到的是不正确的值，而且每次运行的情况可能还有不同。
+- 对于线程持有的自旋锁，可以解锁多次。也就是当线程不再持有锁时，也可以调用`pthread_spin_unlock`而不报错
+- 如果线程已经持有了自旋锁，再次调用`pthread_spin_lock`，则线程彻底死锁。
+
+### 用户协作多个线程并行工作——屏障(一堵墙)
+
+屏障`barrier`是用户协作多个线程并行工作的同步机制。屏障允许每个线程等待，直到所有的合作线程都到达某一点，然后从改点继续执行。
+
+屏障可以理解为一扇门，每个线程不论快慢都需要在这个位置等待，直到所有人都到达了这个位置，才能继续开门执行下一步动作。屏障的作用是同步多个线程的执行，保证每个线程都准备好了，才能一起执行下一步操作
+
+`pthread_join`函数就是一种屏障，它允许一个线程等待，直到另一个线程退出
+
+#### 屏障的初始化与销毁`pthread_barrier_init/pthread_barrier_destroy`
+
+屏障是用`pthread_barrier_t`数据类型表示。
+
+- 使用屏障之前必须初始化。可以调用`pthread_barrier_init`函数进行初始化
+- 在`free`释放内存之前必须调用`pthread_barrier_destroy`函数来销毁屏障。该函数会释放在动态初始化屏障时动态分配的资源
+
+```
+#include<pthread.h>
+int pthread_barrier_init(pthread_barrier_t *restrict barrier,
+	const pthread_barrierattr_t *restrict attr,
+	int count);
+int pthread_barrier_destroy(pthread_barrier_t *barrier);
+```
+
+参数
+
+`barrier`：待初始化/释放的屏障的地址
+
+`attr`：屏障的属性的地址。如果为`NULL`则采用默认属性
+
+`count`：在允许所有线程继续允许之前，必须到达屏障的线程的数量
+
+返回值
+
+- 成功：返回0
+- 失败： 返回错误编号
+
+#### 线程到达屏障并等待其他线程也到达屏障——`pthread_barrier_wait`函数
+
+```
+#include<pthread.h>
+int pthread_barrier_wait(pthread_barrier_t * barrier);
+```
+
+参数：
+
+`barrier`：到达的屏障的地址
+
+返回值：
+
+- 成功：返回0或者`PTHREAD_BARRIER_SERIAL_THREAD`
+- 失败： 返回错误编号
+
+线程调用`pthread_barrier_wait`函数就说明自己已经到达屏障`barrier`，并等待其他线程赶上来。
+
+调用`pthread_barrier_wait`的线程在屏障计数未满足条件时（即：到达屏障的线程数量小于`count`），会进入休眠状态。如果线程调用`pthread_barrier_wait`后，刚好满足了屏障计数条件，则返回 `PTHREAD_BARRIER_SERIAL_THREAD` ，同时所有的等待线程都将被唤醒(同时这些线程上的`pthread_barrier_wait` 函数返回 0）。
+
+一旦到达屏障计数值，而且线程处于非阻塞状态，那么屏障就可以重用（即屏障计数有从零开始）。此时屏障的计数目标数量仍然不变。如果你希望改变计数的目标数量（比如扩大到达线程的目标数量），则必须再一次调用`pthread_barrier_init`函数。
+
+
+
