@@ -1111,3 +1111,540 @@ int getpeername(int sockfd, struct sockaddr *addr, socklen_t *addrlen);
 5. 对于一个使用通配IP地址调用bind的TCP服务器（如图1-9所示），一旦与某个客户端建立连接（accept成功返回），就可以使用`getsockname`函数返回内核赋予该连接的本地IP地址。在这种调用中，套接字描述符参数必须是已连接套接字的描述符，而不是监听套接字的描述符。
 
 ## TCP客户/服务程序示例
+
+本章使用前一章中介绍的基本函数编写一个完整的TCP客户/服务器程序示例。这个简单的例子是执行如下步骤的一个回射服务器：
+
+1. 客户从标准输入读入一行文本，并写给服务器；
+2. 服务器从网络输入读入这行文本，并回射给客户；
+3. 客户从网络输入读入这行回射文本，并显示在标准输出上。
+
+![image-20230707113748143](UNIX网络编程：套接字概念、TCP与UDP编程模型.assets/image-20230707113748143.png)
+
+如上图，我们在客户与服务器之间画了两个单向箭头，但实际上它们构成一个全双工的TCP连接。`fets`和`fputs`函数来自标准IO函数库，`writen`和`readline`这两个函数是我们编写的。
+
+大多数TCP/IP实现已经提供了以上这种回射服务器，有使用UDP的，也有使用TCP的。
+
+回射输入行这样的客户/服务器程序是一个简单而有效的网络应用程序的例子。
+
+### 程序的结构与分块说明
+
+#### TCP回射服务器程序：`main`函数
+
+```c
+#include "unp.h"
+
+int main(int argc, char **argv) {
+    int listenfd, connfd;
+    pid_t childpid;
+    socklen_t clilen;
+    struct sockaddr_in cliaddr, servaddr;
+    
+    listenfd = Socket(AF_INET, SOCK_STREAM, 0);
+    // 创建套接字，捆绑服务器的众所周知端口
+    bzero(&servaddr, sizeof(servaddr));
+    servaddr.sin_family = AF_INET;
+    // 捆绑通配地址，告诉系统，如果系统是多宿主机，则接受目的地址为任何本地接口的地址
+    servaddr.sin_addr.s_addr = htonl(INADDR_ANY);    
+    // 在头文件unp.h中，SERV_PORT的值定义为9877
+    servaddr.sin_port = htons(SERV_PORT);   
+
+    Bind(listenfd, (SA *)&servaddr, sizeof(servaddr));
+    
+    Listen(listenfd, LISTENQ);
+    
+    for (; ; ) {
+        clilen = sizeof(cliaddr);
+        // 服务器阻塞于此，等待客户连接的完成
+        connfd = Accept(listenfd, (SA *)&cliaddr, &clilen);    
+        // 并发服务器配置
+        if ((childpid = Fork()) == 0) {    /* child process */
+            Close(listenfd);    /* close listening socket */
+            str_echo(connfd);    /* process the request */
+            exit(0);
+        }
+        Close(connfd);    /* parent closes connected socket */
+    }
+}
+```
+
+**创建套接字，捆绑服务器的众所周知端口**
+
+创建一个TCP套接字。在待捆绑到该TCP套接字的网际网套接字地址结构中填入通配地址(INADDRANY)和服务器的众所周知端口(SERV_PORT，在头文件unph中其值定义为9877)。捆绑通配地址是在告知系统:要是系统是多宿主机，我们将接受目的地址为任何本地接口的连接。我们对TCP端口号的选择基于图2-10。它应该比1023大（我们不需要一个保留端口），比5000大 (以与许多源自Berkeley的实现分配临时端口的范围冲突)，比49152小(以免与临时端口号的“正确”范围冲突），而且不应该与任何已注册的端口冲突。listen把该套接字转换成一个监听套接字。
+
+**等待完成客户连接** 服务器阻塞于accept调用，等待客户连接的完成。
+
+**并发服务器** `fork`为每个客户派生一个处理它们的子进程。正如我们在4.8节讨论的那样，**子进程关闭监听套接字，父进程关闭已连接套接字**。**子进程接着调用`str_echo`（图5-3）处理客户。**
+
+#### TCP回射服务器程序：`str_echo`函数
+
+```c
+#include "unp.h"
+
+void str_echo(int sockfd) {
+    ssize_t n;
+    char buf[MAXLINE];
+    
+again:
+    // 读入缓冲区并回射其中内容
+    while ((n = read(sockfd, buf, MAXLINE)) > 0) {
+        Writen(sockfd, buf, n);
+    }
+    
+    if (n < 0 && errno == EINTR) {
+        goto again;
+    } else if (n < 0) {
+        err_sys("str_echo: read error\n");
+    }
+}
+```
+
+**读入缓冲区并回射其中内容** `read`函数从套接字读入数据，`writen`函数把其中内容回射给客户。如果客户关闭连接(这是正常情况)，那么接收到客户的FIN将导致服务器子进程的`read`函数返回0，这又导致`str_echo`函数的返回，从而在图5-2中终止子进程。
+
+`fork`函数返回后，子进程关闭监听套接字，父进程关闭已连接套接字，之后子进程调用`str_echo`处理客户请求。
+
+#### TCP回射客户程序：`main`函数
+
+```c
+#include "unp.h"
+
+int main(int argc, char **argv) {
+    int sockfd;
+    struct sockaddr_in servaddr;
+    
+    if (argc != 2) {
+        err_quit("usage: tcpcli <IPaddress>");
+    }
+    //创建套接字，装填网际网套接字地址结构
+    sockfd = Socket(AF_INET, SOCK_STREAM, 0);
+    bzero(&servaddr, sizeof(servaddr));
+    servaddr.sin_family = AF_INET;
+    servaddr.sin_port = htons(SERV_PORT);
+    Inet_pton(AF_INET, argv[1], &servaddr.sin_addr);
+    //连接到服务器
+    Connect(sockfd, (SA *)&servaddr, sizeof(servaddr));
+    
+    /* do it all，完成客户剩余部分的处理工作 */
+    str_cli(stdin, sockfd);    
+    
+    exit(0);
+}
+```
+
+**创建套接字，装填网际网套接字地址结构**创建一个TCP套接字，用服务器的IP地址和端口号装填一个网际网套接字地址结构。我们可从命令行参数取得服务器的IP地址,从头文件unp.h取得服务器的众所周知端口号(SERV_PORT)。
+
+ **连接到服务器**  connect建立与服务器的连接。str_cli函数(图5-5)完成剩余部分的客户处理工作
+
+以上代码中，read函数从套接字读入数据，writen函数把读到的内容回射给客户。如果客户关闭连接，那么接收到客户的FIN将导致服务器子进程的read函数返回0，这又导致str_echo函数的返回，从而在main函数中终止子进程。
+
+以上程序中，服务器父进程大部分时间都会花在阻塞于accept的调用中，而服务器子进程大部分时间花在阻塞于read的调用中。如果服务器设置了SO_KEEPALIVE套接字选项，而且连接上没有数据在交换，如果客户主机崩溃且没有重启，会发生：保持存活选项对于监听套接字不起作用，因此父进程不受客户主机崩溃影响，而子进程的read函数将超时并返回ETIMEDOUT错误。
+
+#### TCP回射客户程序：`str_cli`函数
+
+`str_cli`函数完成客户处理循环:从标准输入读入一行文本，写到服务器上,读回服务器对该行的回射，并把回射行写到标准输出上。
+
+```c
+#include "unp.h"
+
+void str_cli(FILE *fp, int sockfd) {
+    char sendline[MAXLINE], recvline[MAXLINE];
+    //读入一行，写到服务器
+    while (Fgets(sendline, MAXLINE, fp) != NULL) {
+        Writen(sockfd, sendline, strlen(sendline));
+        //从服务器读入回射行，写到标准输出
+        if (Readline(sockfd, recvline, MAXLINE) == 0) {
+            err_quit("str_cli: server terminated prematurely");
+        }
+        Fputs(recvline, stdout);
+        //返回到main函数
+    }
+}
+```
+
+**读入一行，写到服务器** `gets`读入一行文本，`writen`把该行发送给服务器。
+
+**从服务器读入回射行，写到标准输出** `readline`从服务器读入回射行，`fputs`把它写到标准输出。
+
+**返回到main函数** 当遇到文件结束符或错误时，`fgets`将返回一个空指针，于是客户处理循环终止。我们的`Fgets`包裹函数检查是否发生错误，若发生则中止进程，因此`Fgets`只是在遇到文件结束符时才返回一个空指针。
+
+客户端会花费大部分时间在`fgets`函数阻塞等待标准输入的读取操作上。如果客户端使用了SO_KEEPALIVE选项，并且保持存活定时器超时，此时服务器崩溃且没有重启，已连接套接字的待处理错误被设置为ETIMEDOUT，但客户端仍然会阻塞在`fgets`函数上，无法看到这个错误。因此，需要使用select函数来检测套接字是否有可读数据，以便客户端能够及时发现服务器错误。
+
+fgets函数会读取一行文本，直到读取到MAXLINE-1字节、EOF或换行符（fgets函数会保留读到的换行符），然后在读到的数据末尾加上一个空字符。随后，writen函数将读到的该行文本发送给服务器。
+
+readline函数从服务器读取回射行，然后使用fputs函数将其写入标准输出。
+
+当遇到文件结束符或错误时，`fgets`函数会返回一个空指针，客户端的循环会终止。包装函数`Fgets`会检查是否发生错误，如果有错误则终止进程。因此，只有在遇到文件结束符时，`Fgets`函数才会返回一个空指针。
+
+### 正常的运行流程
+
+首先，我们在主机linux 上后台启动服务器。
+
+服务器启动后，它调用socket 、bind 、listen 和accept ，并阻塞于accept 调用。（我们还没有启动客户）。在启动客户之前，我们运行netstat 程序来检查服务器监听套接字的状态。（*号表示处于等待接收状态。）
+
+![image-20230707141541305](UNIX网络编程：套接字概念、TCP与UDP编程模型.assets/image-20230707141541305.png)
+
+上图中只给出了第一行的标题和我们最关心的那行，该命令列出系统中所有套接字的状态，可能会有大量输出，我们必须指定-a（–all）选项查看所有套接字，包括监听套接字和非监听套接字，否则不会列出监听套接字。
+
+以上输出是我们所期望的，它处于LISTEN状态，有通配的本地地址，本地端口为9877。netstat用星号表示一个为0的IP地址（INADDR_ANY）或为0的端口号。
+
+之后在同一主机上启动客户，并指定服务器的主机IP为127.0.0.1（环回地址），当然我们也可指定该地址为主机的非环回IP地址：
+
+![image-20230707141701225](UNIX网络编程：套接字概念、TCP与UDP编程模型.assets/image-20230707141701225.png)
+
+客户调用connect会引起TCP的三路握手过程，当三路握手完成后，客户中的connect函数和服务器的accept函数均返回，连接于是建立。接着会发生如下步骤：
+1.客户调用str_cli函数，该函数阻塞于fgets调用，因为我们还未曾键入过一行文本。
+
+2.服务器中的accept函数返回时，服务器调用fork，再由子进程调用str_echo，该函数调用read，而read函数在等待客户送入一行文本期间阻塞。
+
+3.服务器父进程再次调用accept并阻塞，等待下一个客户连接。
+
+至此，我们有3个正在睡眠的进程：客户进程、服务器父进程、服务器子进程。
+
+以上步骤中，我们先列出客户的步骤，原因在于客户收到三路握手的第2个分节时，connect函数就返回了，而服务器要直到收到三路握手的第3个分节才返回，即在connect函数返回后再过RTT的一半才返回。
+
+**此时的网络状态**
+
+![image-20230707141833780](UNIX网络编程：套接字概念、TCP与UDP编程模型.assets/image-20230707141833780.png)
+
+上图中第一个ESTABLISHED行对应服务器子进程的套接字,因为它的本地端口号是9877;第二个ESTABLISHED行对应客户进程的套接字,因为它的本地端口号是42758。如果我们在不同主机上运行客户和服务器,那么客户主机就只输出客户进程的套接字,服务器主机也只输出两个父子服务器进程的套接字。
+
+我们也可以用ps命令检查这些进程的状态和关系:
+
+![image-20230707141913892](UNIX网络编程：套接字概念、TCP与UDP编程模型.assets/image-20230707141913892.png)
+
+上图中使用了ps命令的特定的命令行参数限定了它只输出与本讨论相关的信息。从上图可见,客户和服务器运行在同一个窗口中(即pts/6,表示伪终端号6)。PID和PPID列给出了进程间的父子关系,子进程的PPID是父进程的PID,因此,第一个tcpserv01是父进程,第二个tcpserv01是子进程,而父进程的PPID是shell(bash)。
+
+上图中3个网络进程的STAT列都是S,表明进程在为等待某些资源而睡眠,WCHAN(表示等待通道(Wait Channel),它显示了进程当前所处的内核等待队列或正在等待的事件)列给出了睡眠状态的进程的情况,Linux在进程阻塞于accept或connect函数时,输出wait_for_connect;进程阻塞于套接字输入或输出时,输出tcp_data_wait;进程阻塞于终端IO时,输出read_chan。
+
+### 正常的终止流程
+
+至此连接已建立,不论我们在客户的标准输入中键入什么,都会回射到它的标准输出中:
+
+![image-20230707142023535](UNIX网络编程：套接字概念、TCP与UDP编程模型.assets/image-20230707142023535.png)
+
+如上图,我们键入的两行都得到了回射,接着我们键入终端EOF字符(Control-D)以终止客户。然后如果立即执行netstat命令,会看到如下结果:
+
+![image-20230707142051624](UNIX网络编程：套接字概念、TCP与UDP编程模型.assets/image-20230707142051624.png)
+
+如上图,当前连接的客户端(它的本地端口为42758)进入了TIME_WAIT状态,而监听服务器仍在等待另一个客户连接。上图中我们让命令netstat的输出通过管道作为grep程序的输入,从而只输出与服务器的众所周知端口相关的文本行,这样做也删掉了标题行。
+
+之后，正常终止客户和服务器的步骤如下：
+
+1. 当我们键入EOF字符时,`fgets`函数返回一个空指针,于是`str_cli`函数返回。
+2. 当`str_cli`函数返回到客户的`main`函数后,`main`调用`exit`终止进程。
+3. 进程终止的部分工作是关闭所有打开的描述符,因此客户打开的套接字由内核关闭。这导致TCP发送一个FIN给服务器,服务器TCP则以ACK响应,这是TCP连接终止序列的前半部分。至此,服务器套接字处于CLOSE_WAIT状态,客户套接字处于FIN_WAIT_2状态。
+4. 当服务器TCP接收到FIN时,服务器子进程阻塞于`readline`调用,于是`readline`函数返回0,这会导致`str_echo`函数返回服务器子进程的`main`函数。
+5. 服务器子进程通过调用`exit`来终止。
+6. 服务器子进程中所有打开描述符随之关闭,子进程关闭已连接套接字会引发TCP连接终止序列的最后两个分节:一个从服务器到客户的FIN和一个从客户到服务器的ACK。至此,连接完全终止,客户套接字进入`TIME_WAIT`状态。
+7. 在服务器子进程终止时,给父进程发送一个`SIGCHLD`信号,但本例中我们没有在代码中捕获该信号,而该信号的默认行为是被忽略。既然父进程未加处理,子进程于是进入僵死状态:
+
+![image-20230707142420920](UNIX网络编程：套接字概念、TCP与UDP编程模型.assets/image-20230707142420920.png)
+
+如上图,子进程的状态是Z(僵死)。程序还需要清理这种僵死进程，这涉及到信号处理。
+
+### 信号的处理
+
+**信号(signal)就是告知某个进程发生了某个事件的通知**,有时也称为软件中断 (software interrupt)。
+
+**信号通常是异步发生的**,也就是说进程预先不知道信号的准确发生时刻。
+
+信号可以: 由一个进程发给另一个进程(或自身); 由内核发给某个进程。
+
+SIGCHLD信号就是内核在任何一个进程终止时发给它的父进程的一个信号。
+
+每个信号都有一个与之相关的处置(disposition),也称为行为(action),我们通过调用sigaction来设定一个信号的处置,有三种选择:
+
+- 我们可以提供一个函数,只要有特定信号发生它就被调用,这样的函数称为信号处理函数,这种行为称为捕获信号。有两个信号不能捕获,它们是SIGKILL和SIGSTOP,信号处理函数的参数只有一个,且是信号值,它没有返回值,信号处理函数原型如下:`void handler(int signo);`。对大多信号来说,调用`sigaction`并指定信号发生时要调用的函数就是捕获信号所需的全部工作,但SIGIO、SIGPOLL、SIGURG信号还要求捕获它的进程做额外工作。
+- 我们可以把某信号的处置设定为SIG_IGN来忽略它,SIGKILL和SIGSTOP不能被忽略。
+
+- 我们可以把某个信号的处置设定为SIG_DFL来使用它的默认处置。默认处置通常是在收到信号后终止进程,其中某些信号还在当前工作目录产生一个核心映像(core image,也称内存影像)。有个别信号的默认处置是忽略,SIGCHLD和SIGURG(带外数据到达)就是默认处置为忽略的其中两个信号。
+
+POSIX建立信号处置的方法是调用sigaction函数,但该函数有点复杂,简单的方法是使用signal函数,它第一个参数是信号名,第二个参数为指向函数的指针或常值SIG_IGN或常值SIG_DFL。但signal函数是早于POSIX出现的历史悠久的函数,调用它时,不同的实现提供不同的信号语义以达成向后兼容,而POSIX明确规定了调用sigaction时的信号语义。我们的解决方法是定义自己的signal函数,它只是调用POSIX的sigaction函数,这就以期望的POSIX语义提供了一个简单的接口,我们把该函数与我们早先编写的err_XXX函数和包裹函数等一起包含在自己的函数库中,后续我们使用的signal函数都是以下函数:
+
+```c
+#include "unp.h"
+
+Sigfunc *signal(int signo, Sigfunc *func) {
+    struct sigaction act, oact;
+    
+    act.sa_handler = func;    // 设置信号处理函数
+    sigemptyset(&act.sa_mask);
+    act.sa_flags = 0;
+    if (signo == SIGALRM) {
+#ifdef SA_INTERRUPT
+        act.sa_flags |= SA_INTERRUPT;    /* SunOS 4.x */
+#endif
+    } else {
+#ifdef SA_RESTART
+        act.sa_flags |= SA_RESTART;    /* SVR4, 4.4BSD */
+#endif    
+    }
+    if (sigaction(signo, &act, &oact) < 0) {
+        return SIG_ERR;
+    }
+    return oact.sa_handler;
+}
+
+```
+
+以上程序中,函数signal的正常函数原型因层次太多显得很复杂:`void (*signal(int signo, void (*func)(int)))(int);`
+
+为简化它,我们在头文件unp.h中定义了如下Sigfunc类型:`typedef void Sigfunc(int);`
+
+Sigfunc类型为仅有一个整数参数且不返回值的函数类型,signal函数的原型于是变为:`Sigfunc *signal(int signo, Sigfunc *func);`
+
+signal函数的第二个参数和返回值都是指向信号处理函数的指针。
+
+POSIX允许我们指定一组信号,它们在信号处理函数被调用时阻塞,任何阻塞的信号都不能递交给进程。以上程序中,我们把sa_mask成员设为空集,意味着在该信号处理函数运行期间,不阻塞额外的信号。POSIX保证被捕获的信号在其信号处理函数运行期间总是阻塞的。
+
+上例程序中,SA_RESTART标志是可选的,如果设置,被相应信号中断的系统调用将由内核自动重启。如果被捕获的信号不是SIGALRM且SA_RESTART有定义,我们就设置该标志,对SIGALRM进行处理的原因在于,产生SIGALRM信号的目的通常是为IO操作设置超时,此时我们希望受阻塞的IO系统调用被该信号中断掉。一些早期的系统(如SunOS 4.x)默认会自动重启被中断的系统调用,而SA_INTERRUPT标志使内核不再自动重启被中断的系统调用,如果定义了SA_INTERRUPT标志,我们就在被捕获的信号是SIGALRM时设置它。
+
+以上代码中,我们的返回值像旧的signal函数的行为一样,返回信号处理函数或SIG_ERR。
+
+我们不愿意留存僵死进程,因为它们会占用内核空间,最终可能导致我们耗尽进程资源。无论何时我们fork子进程后都得wait它们,以防它们变成僵死进程,为此我们建立一个俘获SIGCHLD信号的信号处理函数,在函数中我们调用wait,我们可以在服务器的listen调用后增加以下函数调用建立SIGCHLD信号的信号处理函数:
+
+```
+#include "unp.h"
+
+void sig_chld(int signo) {
+    pid_t pid;
+    int stat;
+    
+    pid = wait(&stat);
+    printf("child %d terminated\n", pid);
+    return;
+}
+```
+
+listen调用之后增加如下函数调用:`**Signal(SIGCHLD,sig_chld);**`
+
+上例代码中,在信号处理函数中调用如printf这样的标准IO函数是不合适的,我们这里调用printf只为查看子进程何时终止。
+
+System V和Unix 98标准下,如果一个进程把SIGCHLD的处置设为SIG_IGN,则它的子进程不会变为僵死进程,但POSIX没有明确表示要这样做,处理僵死进程的可移植方法就是捕获SIGCHLD,并调用wait或waitpid。
+
+在回射服务器中加入信号处理函数后(使用的signal函数来自系统自带的函数库,而非我们自己编写的版本),在Solaris 9下编译该回射服务器,有如下结果:
+
+![image-20230707144948333](UNIX网络编程：套接字概念、TCP与UDP编程模型.assets/image-20230707144948333.png)
+
+1. 我们键入EOF字符来终止客户。客户TCP发送一个FIN给服务器,服务器响应以一个ACK。
+2. 收到客户的FIN导致服务器TCP递送一个EOF给子进程阻塞中的readline,从而子进程终止。
+3. 当SIGCHLD信号递交时,父进程阻塞于accept调用。sig_chld函数(信号处理函数)执行,其wait调用取到子进程的PID和终止状态,随后是printf调用,最后返回。
+4. 既然该信号是在父进程阻塞于慢系统调用 (accept)时由父进程捕获的,内核就会使accept返回一个EINTR错误(被中断的系统调用)。而父进程不处理该错误(图5-2),于是中止。
+
+#### wait和waitpid函数——调用了函数wait来处理已终止的子进程
+
+**函数wait和waitpia均返回两个值:已终止子进程的进程ID号,以及通过staloc指针返回的子进程终止状态(一个整数)。** 它们的更多不同见之前的线程笔记。
+
+如果调用**wait**的进程没有已终止的子进程,不过有一个或多个子进程仍在执行,那么wait将阻塞到现有子进程第一个终止为止。
+
+**waitpid**函数就等待哪个进程以及是否阻塞给了我们更多的控制。**(可以设置要等待的进程ID)** 
+
+首先,**pid参数允许我们指定想等待的进程ID,值-1表示等待第一个终止的子进程。**其次,**options参数允许我们指定附加选项。最常用的选项是WNOHANG,它告知内核在没有已终止子进程时不要阻塞。**
+
+![image-20230707145607668](UNIX网络编程：套接字概念、TCP与UDP编程模型.assets/image-20230707145607668.png)
+
+如图，此类情况下，当客户终止时,所有打开的描述符由内核自动关闭(我们不调用close ,仅调用exit ),且所有5个连接基本在同一时刻终止。这就引发了5个FIN,每个连接一个,它们反过来使服务器的5个子进程基本在同一时刻终止。这又导致差不多在同一时刻有5个SIGCHLD 信号递交给父进程。
+
+采用SIGCHLD 的信号处理函数，只能处理一个，还有四个僵死的子进程。
+
+建立一个信号处理函数并在其中调用wait 并不足以防止出现僵死进程。本问题在于:所有5个信号都在信号处理函数执行之前产生, 而信号处理函数只执行一次,因为Unix信号一般是不排队的 。更严重的是,本问题是不确定的。在我们刚刚运行的例子中,客户与服务器在同一个主机上,信号处理函数执行1次,留下4个僵死进程。但是如果我们在不同的主机上运行客户和服务器,那么信号处理函数一般执行2次:一次是第一个产生的信号引起的,由于另外4个信号在信号处理函数第一次执行时发生,因此该处理函数仅仅再被调用一次,从而留下3个僵死进程。不过有的时候,依赖于FIN到达服务器主机的时机,信号处理函数可能会执行3次甚至4次。
+
+**正确的解决办法是调用waitpid，我们在一个循环内调用waitpid ,以获取所有已终止子进程的状态。**我们必须指定WNOHANG 选项,它告知waitpid 在有尚未终止的子进程在运行时不要阻塞。
+
+本节的目的是示范我们在网络编程时可能会遇到的三种情况:
+
+1. 当fork 子进程时,必须捕获SIGCHLD 信号;
+
+2. 当捕获信号时,必须处理被中断的系统调用; 
+
+3. SIGCHLD 的信号处理函数必须正确编写,应使用waitpid 函数以免留下僵死进程。
+
+4. ```c
+   #include "unp.h"
+   
+   void str_echo(int sockfd) {
+       ssize_t n;
+       char buf[MAXLINE];
+       
+   again:
+       while ((n = read(sockfd, buf, MAXLINE)) > 0) {
+           Writen(sockfd, buf, n);
+       }
+       
+       if (n < 0 && errno == EINTR) {
+           goto again;
+       } else if (n < 0) {
+           err_sys("str_echo: read error\n");
+       }
+   }
+   
+   int main(int argc, char **argv) {
+       int listenfd, connfd;
+       pid_t childpid;
+       socklen_t clilen;
+       struct sockaddr_in cliaddr, servaddr;
+       
+       listenfd = Socket(AF_INET, SOCK_STREAM, 0);
+       
+       bzero(&servaddr, sizeof(servaddr));
+       servaddr.sin_family = AF_INET;
+       // 捆绑通配地址，告诉系统，如果系统是多宿主机，我们接受目的地址为任何本地接口的地址
+       servaddr.sin_addr.s_addr = htonl(INADDR_ANY);    
+       // 在头文件unp.h中，SERV_PORT的值定义为9877
+       servaddr.sin_port = htons(SERV_PORT);    
+   
+       Bind(listenfd, (SA *)&servaddr, sizeof(servaddr));
+       
+       Listen(listenfd, LISTENQ);
+    
+       Signal(SIGCHLD, sig_chld);
+      
+       for (; ; ) {
+           clilen = sizeof(cliaddr);
+           if ((connfd = accept(listenfd, (SA *)&cliaddr, &clilen)) < 0) {
+               if (errno = EINTR) {
+                   continue;    /* back to for() */
+               } else {
+                   err_sys("accept error");
+               }
+           }
+           
+           if ((childpid = Fork()) == 0) {    /* child process */
+               Close(listenfd);    /* close listening socket */
+               str_echo(connfd);    /* process the request */
+               exit(0);
+           }
+           Close(connfd);    /* parent closes connected socket */
+       }
+   }
+   
+   ```
+
+   
+
+### 更多的异常情况与处理介绍
+
+#### accept返回前连接中止
+
+还有一种情形会导致accept函数返回一个非致命错误,此时只需再次调用accept,以下分组序列在较忙的服务器上会出现:
+
+![image-20230707152333125](UNIX网络编程：套接字概念、TCP与UDP编程模型.assets/image-20230707152333125.png)
+
+如上图,三路握手完成从而连接建立后,客户TCP却发送了一个RST,在服务器看来,该连接已由TCP排队,之后在服务器进程调用accept之前,RST到达。
+
+模拟这种情况的一个简单方法是,启动服务器,调用socket、bind、listen,然后在调用accept前睡眠一小段时间。在服务器进程睡眠时,启动客户进程,调用socket、connect,一旦connect函数返回,就设置SO_LINGER套接字选项产生这个RST,然后终止。
+
+如何处理上述这种中止的连接依赖于不同的实现。源自Berkeley的实现完全在内核中处理中止的连接,服务器进程根本看不到。大多SVR 4实现返回一个错误给服务器进程,作为accept函数的返回结果,这些SVR 4实现返回一个EPROTO(protocol error,协议错误)作为errno值,而POSIX指出返回的errno值必须是ECONNABORTED(Connection aborted)。POSIX作出修改的理由在于,流子系统中发生某些致命的协议相关事件时,也会返回EPROTO,要是对于由客户引起的一个已建立连接的非致命终止也返回同样的错误,服务器就不知道该不该再次调用accept,换成ECONNABORTED错误后,服务器就可以忽略它,再次调用accept就行。
+
+#### 服务器进程崩溃终止
+
+启动客户和服务器,然后杀死服务器子进程,这是在模拟服务器进程崩溃的情形,然后查看客户将发生什么,步骤如下:
+
+1. 在同一主机上启动客户和服务器,并在客户上键入一行文本,验证一切正常。
+2. 找到服务器子进程的进程ID,执行kill命令杀死它。作为进程终止处理的部分工作,子进程中所有打开着的描述符都被关闭,这导致向客户发送一个FIN,而客户TCP会响应一个ACK。这是TCP连接终止工作的前半部分。
+
+3. SIGCHLD信号被发送给服务器父进程,并得到处理。
+
+4. 客户TCP接收来自服务器TCP的FIN并响应一个ACK,但客户进程还阻塞在fgets调用上,等待从终端接收一行文本。
+
+5. 此时,在另一个窗口上运行stat命令,观察套接字状态,我们会发现TCP连接终止序列的前半部分已经完成(FIN_WAIT2是主动发起连接关闭的一方在收到对于FIN的ACK后进入的状态):
+
+![image-20230707152530220](UNIX网络编程：套接字概念、TCP与UDP编程模型.assets/image-20230707152530220.png)
+
+6.在客户上再键入一行文本:
+
+![image-20230707152615360](UNIX网络编程：套接字概念、TCP与UDP编程模型.assets/image-20230707152615360.png)
+
+如上图,我们键入another line时,str_cli函数调用writen,客户TCP接着把数据发送给服务器,TCP允许这么做,因为客户TCP接收到FIN只是表示服务器进程不再发送任何数据,FIN的接收并没有告知客户TCP服务器进程已终止(但本例中,它确实是终止了)。当服务器TCP接收到来自客户的数据时,既然先前打开那个套接字的进程已经终止,于是响应一个RST,该RST可通过tcpdump观察到。此时,连接被终止,连接终止序列的最后两个分节不再发送,并且该RST使得服务器端(主动执行连接关闭的一端)不再经历TIME_WAIT状态。
+
+7.但客户进程看不到这个RST,因为它在调用writen后立即调用了readline,RST还没到,并且由于第2步中接收到的FIN,readline函数返回0(表示EOF),我们的客户未预期收到EOF,于是打印出错信息server terminated prematurely(服务器过早终止)并退出。
+
+8.当客户终止时,它所有打开着的描述符都被关闭。
+
+上述讨论还取决于客户调用readline既可能发生在服务器的RST被客户收到之前,也可能发生在收到之后,如果readline调用发生在收到RST之前(如上所述),那么结果是客户得到一个预期外的EOF,否则结果是由readline函数返回一个ECONNRESET(connection reset by peer,对方复位连接错误)。
+
+上例的问题在于,当FIN到达套接字时,客户正阻塞在fgets调用上,客户实际上在应对两个描述符,即套接字和用户输入,它不能单纯阻塞在这两个源中某个特定源的输入上,而是应该阻塞在任何一个源的输入上,这正是select和poll函数的目的之一。
+
+如果客户不理会readline函数返回的错误,继续写更多数据到服务器上,这种情况是可能的,如客户可能在读回数据前执行两次对服务器的写操作,而RST由第一次写操作引发时。当一个进程向某个已收到RST的套接字执行写操作时,内核向该进程发送一个SIGPIPE信号,该信号的默认行为是终止进程,因此进程必须捕获它以免被终止。不论该进程是捕获了该信号并从其信号处理函数返回,还是简单地忽略该信号,写操作都将返回EPIPE错误。
+
+一个在usenet上的FAQ(Frequently Asked Question,经常问及的问题)是如何在第一次写操作时而非第二次写操作时捕获SIGPIPE信号,这是不可能的,按上述讨论,第一次写操作引发RST,第二次写引发SIGPIPE信号。写一个已接收了FIN的套接字没问题,但写一个已接收了RST的套接字则是一个错误。
+
+为了看有了SIGPIPE信号会发生什么,我们修改客户程序:
+
+```c
+void str_cli(FILE *fp, int sockfd) {
+    char readline[MAXLINE], recvline[MAXLINE];
+    while (Fgets(sendline, MAXLINE, fp) != NULL) {
+        Writen(sockfd, sendline, 1);
+        sleep(1);
+        Writen(sockfd, sendline + 1, strlen(sendline) - 1);
+        if (Readline(sockfd, recvline, MAXLINE) == 0) {
+            err_quit("str_cli: server terminated prematurely");
+        }
+        Fputs(recvline, strout);
+    }
+}
+```
+
+我们做的修改就是调用writen两次,第一次把文本行数据的第1个字节写入套接字,暂停1秒后,第二次把同一文本行中剩余字节写入套接字,目的是让第一次writen调用引发一个RST,再让第二个writen调用产生SIGPIPE。
+
+启动客户,键入一行文本,看到它被正确回射后,在服务器主机上终止服务器子进程,接着键入另一行文本bye,结果是没有任何回射,而shell告诉我们客户进程因为SIGPIPE信号死亡了,当前台进程未执行core dump就死亡时,有些shell不显示任何信息。
+
+**处理SIGPIPE的建议方法取决于它发生时应用进程想做什么,如果没有特殊的事情要做,则将信号处理办法直接设置为SIG_IGN,并且在写失败后查看errno是否是EPIPE错误,如果是则停止写入;如果信号出现时需采取特殊措施(可能需要在日志中登记),则要捕获该信号,以便在信号处理函数中执行所期望的动作,但如果使用了多个套接字,该信号的递交无法告诉我们哪个套接字出了错,如果我们确实需要知道哪个write函数出了错,需要在write函数失败后查看errno是否是EPIPE。**
+
+#### 服务器主机崩溃
+
+模拟这种情况需要在不同主机上运行客户和服务器,我们先启动服务器,再启动客户,接着在客户上键入一行文本以确认连接工作正常,然后从网络上断开服务器主机,然后在客户上键入另一行文本,这样同时也模拟了当客户发送数据时服务器主机不可达情形(即建立连接后某些中间路由器又不工作了)。
+
+为了测试服务器主机崩溃后会发生什么，需要在不同的主机上运行客户端和服务器端。首先启动服务器，然后启动客户端，并在客户端上输入一行文本以确认连接正常。接下来，模拟服务器主机不可达的情况，可以通过从网络上断开它来实现。当服务器主机崩溃时，它不会在现有的网络连接上发出任何东西。客户端在发送数据时会持续重传数据分节，直到最终放弃并返回错误。这个过程可以使用readline调用设置超时来更快地检测到服务器主机的崩溃。如果想在不主动发送数据的情况下检测到服务器主机的崩溃，可以使用SO_KEEPALIVE套接字选项。
+
+#### 服务器主机崩溃后重启
+
+我们发送数据时,服务器主机仍处于崩溃状态,我们将模拟服务器主机在客户TCP持续重传期间重启。模拟这种情形的最简单方法是:先建立连接,再从网络上断开服务器主机,将它关机后再重启,最后把它重新连接到网络中(我们不想客户知道服务器主机的关机)。
+
+假设没有使用SO_KEEPALIVE选项,所发生的步骤如下:
+1.启动服务器和客户,并在客户键入一行文本以确认连接已建立。
+
+2.服务器主机崩溃并重启。
+
+3.在客户上键入一行文本,它将作为一个TCP数据分节发送到服务器主机。
+
+4.当服务器主机崩溃并重启后,它的TCP丢失了崩溃前所有连接信息,因此服务器TCP对所收到的来自客户的数据分节响应一个RST。
+
+5.当客户TCP收到该RST时,客户正阻塞于readline调用,导致该调用返回ECONNRESET错误。
+
+以上过程中,如果服务器进程在服务器主机重启后又启动了,那么服务器TCP在收到消息后还是会返回一个RST。
+
+如果对客户而言检测服务器主机是否崩溃很重要,即使客户不主动发送数据也要能检测出来,就需要使用其他技术(如SO_KEEPALIVE套接字选项或某些客户/服务器心博函数)。
+
+#### 服务器关机
+
+当服务器进程正在运行时,如果服务器被关机,如果是Unix系统被关机,init进程通常先给所有进程发送SIGTERM信号(该信号可被捕获),等待一段固定时间(通常在5到20秒之间),然后给所有仍在运行的进程发送SIGKILL信号(该信号不可被捕获)。这样给所有运行的进程一小段时间来清除和终止,如果我们捕获SIGTERM信号后没有终止,我们的服务器将由SIGKILL信号终止。当服务器子进程终止时,它的所有打开着的描述符都被关闭,随后发送FIN给客户。对于客户,需要使用select或poll函数,使服务器进程的终止一经发生(收到服务器的FIN),客户机就能检测到。
+
+#### TCP程序例子小结
+
+在TCP客户端和服务器端建立通信之前，每一端都需要指定连接的四个值：本地IP地址、本地端口、远程IP地址和远程端口。对于客户端来说，远程IP地址和远程端口必须在调用connect函数时指定，而两个本地值通常由内核自动选定。在连接建立后，客户端可以通过调用getsockname函数获取由内核指定的两个本地值。对于服务器端来说，本地端口（也就是众所周知的端口号）需要在调用bind函数时指定。服务器指定的本地IP地址通常是通配IP地址。通过调用accept函数，服务器可以获取两个远程值，也就是客户端的IP地址和端口号。如果服务器通过调用exec函数来执行另一个程序，那么新程序可以在必要时调用getpeername函数来获取客户端的IP地址和端口号。
+
+![image-20230707162240088](UNIX网络编程：套接字概念、TCP与UDP编程模型.assets/image-20230707162240088.png)
+
+![image-20230707162252031](UNIX网络编程：套接字概念、TCP与UDP编程模型.assets/image-20230707162252031.png)
+
+### 数据格式
+
+在我们的例子中,服务器从不检查来自客户的请求。它只管读入直到换行符(包括换行符)的所有数据,把它发回给客户,所搜索的仅仅是换行符。这只是一个例外,而不是通常规则,一般来说,我们必须关心在客户和服务器之间进行交换的数据的格式。
+
+如果调用sscanf 把文本串中的两个参数转换为长整数,然后调用snprintf 把结果转换为文本串。不论客户和服务器主机的字节序如何,这个新的客户和服务器程序对都工作得很好。
+
+把客户和服务器程序修改为穿越套接字传递二进制值(而不是文本串)。我们将看到,当这样的客户和服务器程序运行在字节序不一样的或者所支持长整数的大小不一致的两个主机上时,工作将失常。如果在具有不同体系结构的两个主机上运行同样的客户和服务器程序(譬如说服务器程序运行在大端字节序的SPARC系统freebsd 上,客户运行在小端字节序的Intel系统linux 上),那就无法工作了。
+
+问题在于由客户以小端字节序格式穿越套接字送出的两个二进制整数,却被服务器解释成了大端字节序整数。我们看到这对客户和服务器对于正整数看起来工作正常,但是对于负整数则工作失常了。
+
+本例子实际上存在三个潜在的问题。
+
+1. 不同的实现以不同的格式存储二进制数。最常见的格式便是3.4节讨论过的大端字节序与小端字节序。
+2. 不同的实现在存储相同的C数据类型上可能存在差异。举例来说,大多数32位Unix系统使用32位表示长整数,而64位系统却典型地使用64位来表示同样的数据类型(图1-17)。对于short 、int 或long 等整数类型,它们各自的大小没有确定的保证。
+3. 不同的实现给结构打包的方式存在差异,取决于各种数据类型所用的位数以及机器的对齐限制。因此,穿越套接字传送二进制结构绝不是明智的
+
+解决这种数据格式问题有两个常用方法。
+
+1. 把所有的数值数据作为文本串来传递，当然这里假设客户和服务器主机具有相同的字符集。
+2. 显式定义所支持数据类型的二进制格式(位数、大端或小端字节序),并以这样的格式在客户与服务器之间传递所有数据。远程过程调用(Remote Procedure Call,RPC)软件包通常使用这种技术。
