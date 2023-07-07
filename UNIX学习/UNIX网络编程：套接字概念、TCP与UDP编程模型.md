@@ -1648,3 +1648,414 @@ void str_cli(FILE *fp, int sockfd) {
 
 1. 把所有的数值数据作为文本串来传递，当然这里假设客户和服务器主机具有相同的字符集。
 2. 显式定义所支持数据类型的二进制格式(位数、大端或小端字节序),并以这样的格式在客户与服务器之间传递所有数据。远程过程调用(Remote Procedure Call,RPC)软件包通常使用这种技术。
+
+## 基本UDP套接字编程
+
+在使用TCP编写的应用程序和使用UDP编写的应用程序之间存在一些本质差异,其原因在于这两个传输层之间的差别:UDP是无连接不可靠的数据报协议,非常不同于TCP提供的面向连接的可靠字节流。
+
+客户不与服务器建立连接,而是只管使用`sendto` 函数(将在下一节介绍)给服务器发送数据报,其中必须指定目的地(即服务器)的地址作为参数。类似地,服务器不接受来自客户的连接,而是只管调用`recvfrom` 函数,等待来自某个客户的数据到达。`recvfrom` 将与所接收的数据报一道返回客户的协议地址,因此服务器可以把响应发送给正确的客户。
+
+![image-20230707174125485](UNIX网络编程：套接字概念、TCP与UDP编程模型.assets/image-20230707174125485.png)
+
+### `recvfrom` 和`sendto` 函数
+
+这两个函数类似于标准的read 和write 函数,不过需要三个额外的参数。
+
+```
+#include <sys/socket.h>
+
+ssize_t recvfrom(int sockfd, void *buff, size_t nbytes, int flags,
+                 struct sockaddr *from, socklen_t *addrlen);
+
+ssize_t sendto(int sockfd, const void *buff, size_t nbytes, int flags,
+               const struct sockaddr *to, socklen_t *addrlen);
+```
+
+参数：
+- `sockfd`: 套接字文件描述符
+- `buff`: 指向接收或发送数据的缓冲区
+- `nbytes`: 接收或发送的字节数
+- `flags`: 控制接收或发送的行为
+- `from`: 指向发送数据的对端的地址信息的缓冲区，用于接收数据时返回对端地址信息
+- `to`: 指向接收数据的对端的地址信息的缓冲区，用于发送数据时指定对端地址信息
+- `addrlen`: 指向 `from` 或 `to` 的地址信息缓冲区的长度
+
+返回值
+- `recvfrom()` 返回接收到的字节数，如果返回值为 0，表示对端已关闭连接，如果返回值为 -1，表示发生错误
+- `sendto()` 返回发送的字节数，如果返回值为 -1，表示发生错误
+
+作用
+- `recvfrom()` 从套接字接收数据，并将对端地址信息存储到 `from` 中
+- `sendto()` 向指定地址发送数据
+
+前三个参数sockfd、buff、nbytes等同于read和write函数的三个参数,分别是描述符、指向读入或写出缓冲区的指针和读写字节数。
+
+flags参数后面介绍,在这之前改参数使用时总是置0。
+
+`sendto`函数的to参数指向一个含有数据报接收者的协议地址(如IP地址、端口号)的套接字地址结构,其大小由`addrlen`参数指定。`recvfrom`函数的from参数指向由该函数在返回时填写的数据报发送者的协议地址的套接字地址结构,该套接字地址结构的字节数放在addrlen参数所指的整数中返回给调用者。
+
+`sendto`函数的最后一个参数类型是`socklen_t`,是一个整数值,而`recvfrom`的最后一个参数是指向整数值的指针(即值-结果参数)。
+
+`recvfrom`函数的最后两个参数类似于accept函数的最后两个参数,返回时套接字地址结构中的内容告诉我们是谁发送了数据报(`recvfrom`函数)或是谁发起了连接(`accept`函数)。`sendto`函数的最后两个参数类似于`connect`函数的最后两个参数:调用时其中套接字地址结构内容含义是,被我们填入的数据报将发往该地址(`sendto`函数)或与之建立连接(`connect`函数)的协议地址。
+
+这两个函数的返回值都是所读写的数据长度,`recvfrom`函数用于数据报协议时,返回值就是所接收数据报中的用户数据量。
+
+可以写一个长度为0的数据报,在UDP情况下,这会形成一个只包含一个IP首部(IPv4通常为20字节,IPv6通常为40字节)和一个8字节UDP首部而没有数据的IP数据报。这意味着对于数据报协议,`recvfrom`函数返回0是可接受的,它不像TCP套接字上read函数返回0值表示对端关闭连接。
+
+如果`recvfrom`函数的`from`函数是一个空指针,则相应的长度参数也必须是一个空指针,表示我们不关心发送者的协议地址。
+`recvfrom`和`sendto`函数都可用于TCP,但通常没有理由这么做。
+
+### UDP回射服务器程序:main函数
+
+```c
+#include "unp.h"
+
+int main(int argc, char **argv) {
+    int sockfd;
+    struct sockaddr_in servaddr, cliaddr;
+
+    // 通过将第二个参数指定为SOCK_DGRAM（IPv4协议中的数据报套接字）创建一个UDP套接字
+    sockfd = Socket(AF_INET, SOCK_DGRAM, 0);
+
+    bzero(&servaddr, sizeof(servaddr));
+    servaddr.sin_family = AF_INET;
+    servaddr.sin_addr.s_addr = htonl(INADDR_ANY);
+    servaddr.sin_port = htons(SERV_PORT);
+
+    Bind(sockfd, (SA *)&servaddr, sizeof(servaddr));
+
+    dg_echo(sockfd, (SA *)&cliaddr, sizeof(cliaddr));
+}
+
+```
+
+创建UDP套接字，捆绑服务器的众所周知端口。
+
+我们通过将socket函数的第二个参数指定为SOCK DGRAM (IPv4协议中的数据报套接字)创建一个UDP套接字。正如TCP服务器程序的例子，用于bina的服务器IPv4地址被指定为INADDR_ANY（任意地址），而服务器的众所周知端口是头文件<unp.h>中定义的SERV_PORT常值。 
+
+接着，调用函数dg_echo来执行服务器的处理工作。
+
+### UDP回射服务器程序:`dg_echo`函数
+
+```c
+void dg_echo(int sockfd, SA *pcliaddr, socklen_t clilen) {
+    int n;
+    socklen_t len;
+    char mesg[MAXLINE];
+
+    for (; ; ) {
+        len = clilen;
+		n = Recvfrom(sockfd, mesg, MAXLINE, 0, pcliaddr, &len);
+
+        // 此处最后一个参数使用len而非clilen
+        // 因为如果协议使用的是变长套接字地址结构
+        // 可能clilen会太大，应使用recvfrom函数返回的真正长度
+		Sendto(sockfd, mesg, n, 0, pcliaddr, len);
+    }
+}
+
+```
+
+**读数据报并回射给发送者** 
+
+**8~12** 它使用recvfrom读入下一个到达服务器端口的数据报，再使用该函数是一个简单的循环，"sendto把它发送回发送者。
+
+该函数提供的是一个迭代服务器，而TCP服务器提供的是一个并发服务器（fork函数创建子进程）。
+
+UDP是一个无连接协议，没有像TCP中的EOF表示连接结束。该函数提供的是一个迭代服务器，不支持并发。对于UDP套接字，每个数据报都会进入接收缓冲区，进程调用recvfrom时会按照先入先出的顺序返回缓冲区中的下一个数据报。如果有多个数据报到达，它们会依次加入缓冲区，但缓冲区大小是有限制的。之前我们在讨论SO_RCVBUF套接字选项时也提到过如何增大缓冲区大小。
+
+![image-20230707175951107](UNIX网络编程：套接字概念、TCP与UDP编程模型.assets/image-20230707175951107.png)
+
+### UDP回射客户程序的main函数
+
+```c
+#include "unp.h"
+
+// 协议无关的函数
+void dg_cli(FILE *fp, int sockfd, const SA *pservaddr, socklen_t servlen) {
+    int n;
+    char sendline[MAXLINE], recvline[MAXLINE + 1];
+
+    while (Fgets(sendline, MAXLINE, fp) != NULL) {
+        Sendto(sockfd, sendline, strlen(sendline), 0, pservaddr, servlen);
+
+        // 最后两个参数都是空指针，这告知内核我们不关心应答数据报由谁发送
+        // 这存在一个风险，任何进程都可以向本客户的IP和端口发送数据报，这些数据报被客户读入并被认为是服务器的应答
+		n = Recvfrom(sockfd, recvline, MAXLINE, 0, NULL, NULL);
+	
+		recvline[n] = 0;    /* null terminate */
+		Fputs(recvline, stdout);
+    }
+}
+
+// 协议相关的函数
+int main(int argc, char **argv) {
+    int sockfd;
+    struct sockaddr_in servaddr;
+
+    if (argc != 2) {
+        err_quit("usage: udpcli <IPaddress>");
+    }
+
+    bzero(&servaddr, sizeof(servaddr));
+    servaddr.sin_family = AF_INET;
+    servaddr.sin_port = htons(SERV_PORT);
+    Inet_pton(AF_INET, argv[1], &servaddr.sin_addr);
+
+    sockfd = Socket(AF_INET, SOCK_DGRAM, 0);
+
+    dg_cli(stdin, sockfd, (SA *)&servaddr, sizeof(servaddr));
+
+    exit(0);
+}
+```
+
+**把服务器地址填入套接字地址结构**
+
+ 9~12 把服务器的IP地址和端口号填入一个IPv4的套接字地址结构。该结构将传递给dg_cli函数，以指明数据报将发往何处。 
+
+13~14 创建一个UDP套接字，然后调用dg_cli函数。
+
+### UDP回射客户程序:`dg_cli`函数
+
+```c
+void dg_cli1(FILE *fp, int sockfd, SA *pservaddr, socklen_t servlen) {
+    int n;
+    char sendline[MAXLINE], recvline[MAXLINE + 1];
+    socklen_t len;
+    struct sockaddr *preply_addr;
+
+    preply_addr = Malloc(servlen);
+
+    while (Fgets(sendline, MAXLINE, fp) != NULL) {
+        Sendto(sockfd, sendline, strlen(sendline), 0, pservaddr, servlen);
+
+		len = servlen;
+		n = Recvfrom(sockfd, recvline, MAXLINE, 0, pservaddr, &len);
+		if (len != servlen || memcmp(pservaddr, preply_addr, len) != 0) {
+		    printf("reply from %s (ignored)\n", Sock_ntop(preply_addr, len));
+		    continue;
+		}
+	
+		recvline[n] = 0;    /* null terminate */
+		Fputs(recvline, stdout);
+    }
+}
+```
+
+**7~12** 客户处理循环中有四个步骤：
+
+**使用`fgets`从标准输入读入一个文本行，**
+
+**使用`sendto`将该文本行发送给服务器，**
+
+**使用`recvfrom`读回服务器的回射，**
+
+**使用`fputs`把回射的文本行显示到标准输出。**
+
+注意，**调用`recvfrom`指定的第五和第六个参数是空指针。**
+
+这告知内核我们并不关心应答数据报由谁发送。这样做存在一个风险:任何进程不论是在与本客户进程相同的主机上还是在不同的主机上，都可以向本客户的IP地址和端口发送数据报，这些数据报将被客户读入并被认为是服务器的应答。
+
+与服务器的`dg_echo` 函数一样,客户的`dg_cli` 函数也是协议无关的,不过客户的main 函数是协议相关的。main 函数分配并初始化一个某个协议类型的套接字地址结构,并把指向该结构的指针及该结构的大小传递给`dg_cli` 。
+
+#### 数据报的丢失
+
+我们的UDP客户/服务器例子是不可靠的，可能会因为数据包丢失而导致客户端一直等待服务器响应，或者服务器一直等待客户端请求。为了避免永久阻塞，可以给客户端的recvfrom调用设置超时。但是仅仅设置超时并不能完全解决问题，因为我们无法确定超时的原因是客户端请求没有到达服务器，还是服务器的响应没有回到客户端。如果客户端请求需要可靠处理，例如转账操作，那么请求丢失和响应丢失的后果是非常不同的。我们将在后续章节中讨论如何增加UDP客户/服务器程序的可靠性。
+
+#### 验证接收到的响应
+
+知道客户临时端口号的任何进程都可往客户发送数据报,而且这些数据报会与正常的服务器应答混杂。我们的解决办法是修改图8-8中的recvfrom 调用以返回数据报发送者的IP地址和端口号,保留来自数据报所发往服务器的应答,而忽略任何其他数据报。然而这样做照样存在一些缺陷,我们马上就会看到。
+
+重写dg_cli函数以分配另一个套接字地址结构用于存放由recvfrom返回的结构
+
+recvfrom 返回的IP地址(UDP数据报的源IP地址)不是我们所发送数据报的目的IP地址。当服务器发送应答时,目的IP地址是172.24.37.94。主机freebsd4 内核中的路由功能为之选择172.24.37.78作为外出接口。既然服务器没有在其套接字上绑定一个实际的IP地址(服务器绑定在其套接字上的是通配IP地址,这一点可通过在freebsd4 上运行netstat 来验证),因此内核将为封装这些应答的IP数据报选择源地址。选为源地址的是外出接口的主IP地址(TCPv2第232~233页)。还有,既然它是外出接口的主IP地址,如果我们指定发送数据报到该接口的某个非主IP地址(即一个IP别名),那么也将导致图8-9版本客户程序的测试失败。
+
+一个解决办法是:**得到由recvfrom 返回的IP地址后,客户通过在DNS(第11章)中查找服务器主机的名字来验证该主机的域名(而不是它的IP地址)。**
+
+另一个解决办法是:**UDP服务器给服务器主机上配置的每个IP地址创建一个套接字,用bind 捆绑每个IP地址到各自的套接字,然后在所有这些套接字上使用select (等待其中任何一个变得可读),再从可读的套接字给出应答。**既然用于给出应答的套接字上绑定的IP地址就是客户请求的目的IP地址(否则该数据报不会被投递到该套接字),这就保证应答的源地址与请求的目的地址相同。
+我们将在22.6节给出一个这样的例子。
+
+#### 服务器进程未运行
+
+不启动服务器的前提下启动客户。如果我们这么做后在客户上键入一行文本,那么什么也不发生。客户永远阻塞于它的recvfrom 调用,等待一个永不出现的服务器应答。
+
+如果服务器进程未运行,启动客户后键入一行文本,那将什么也不发生,客户永远阻塞于它的recvfrom调用,等待一个永不出现的服务器应答。模拟以上情况,我们在主机macosx上启动tcpdump,然后在同一主机上启动客户,然后指定freebsd4为服务器主机(该主机上没有启动服务器进程),接着我们键入一行文本,该文本不会被回射。
+
+客户主机在往服务器主机发UDP数据报前,需要一次ARP请求和应答的交换。
+
+第三行客户数据报发出,长度为13,包含12个字符和1个换行符。第四行服务器主机响应的是一个端口不可达ICMP消息,但这个ICMP错误不返回给客户进程,客户将永远阻塞于recvfrom调用。ICMPv6也有端口不可达错误,因此此处的讨论对IPv6也类似。
+
+我们称以上ICMP错误为异步错误,该错误由sendto函数引起,但sendto函数本身却成功返回。UDP输出操作成功返回仅仅表示在接口输出队列中有存放所形成的IP数据报的空间。
+
+对于UDP套接字,由它引发的异步错误不会返回给它,除非它已连接(给UDP套接字调用connect)。
+
+如果我们在单个UDP套接字上发送3个数据报给3个不同的服务器(3个不同的IP地址),该客户随后进入一个调用recvfrom读取应答的循环,其中有两个UDP数据报被正确递送,但第三个主机上没有运行服务器,于是第三个主机响应一个ICMP端口不可达错误,这个ICMP出错消息包含引起错误的数据报的IP首部和UDP首部(ICMPv4和ICMPv6出错消息总是包含IP首部和所有UDP首部或部分TCP首部,以便接收者确定由哪个套接字引发该错误),但recvfrom函数可返回的信息仅有errno值,没有办法返回出错数据报的目的IP地址和目的UDP端口号,因此有以下规定:仅在进程已将其UDP套接字连接到唯一一个对端后,这些异步错误才返回给进程。
+
+只要SO_BSDCOMPAT套接字选项没有开启,Linux对未连接的UDP套接字也返回大多数ICMP目的地不可达错误。
+
+### UDP程序例子小结
+
+![image-20230707185826677](UNIX网络编程：套接字概念、TCP与UDP编程模型.assets/image-20230707185826677.png)
+
+上图展示了在客户端发送UDP数据报时需要指定或选择的四个值，即目的IP地址、目的端口号、源IP地址和源端口号。通常情况下，客户端的IP地址和端口号由内核自动选择，但是客户端也可以通过调用bind函数来指定它们。如果客户端的IP地址和端口号由内核选择，那么客户端的临时端口号在第一次调用sendto函数时被选定，并且不能改变。但是客户端的IP地址可以随着每个UDP数据报的发送而变化（假设客户端没有绑定一个具体的IP地址到套接字上），特别是在客户端主机有多个网络接口的情况下。如果客户端绑定了一个IP地址到套接字上，但是内核决定发送数据报必须从另一个网络接口出去，那么发送的IP数据报将包含一个不同于客户端IP地址的源IP地址。
+
+![image-20230707185854331](UNIX网络编程：套接字概念、TCP与UDP编程模型.assets/image-20230707185854331.png)
+
+上图从服务器的角度给出了同样的四个值，即源IP地址、源端口号、目的IP地址和目的端口号。服务器可能需要从到达的IP数据报中获取这些信息。对于TCP服务器，它可以方便地访问所有这四条信息，而且这些值在连接的整个生命周期中保持不变。但是对于UDP套接字，目的IP地址只能通过设置IP_RECVDSTADDR套接字选项（对于IPv6，使用IPV6_PKTINFO选项），然后调用recvmsg函数来获取。由于UDP是无连接的，因此目的IP地址可能会随每个数据报的到达而改变。此外，UDP服务器还可以接收发送到服务器主机的广播地址或多播地址的数据报。
+
+### UDP的connect函数
+
+除非套接字已连接,否则异步错误是不会返回到UDP套接字的。我们确实可以给UDP套接字调用connect (4.3节),然而这样做的结果却与TCP连接大相径庭:没有三路握手过程。内核只是检查是否存在立即可知的错误(例如一个显然不可达的目的地),记录对端的IP地址和端口号(取自传递给connect 的套接字地址结构),然后立即返回到调用进程。
+
+须区分: 未连接UDP套接字(unconnected UDP socket),新创建UDP套接字默认如此; 已连接UDP套接字(connected UDP socket),对UDP套接字调用connect 的结果。
+
+对于已连接UDP套接字，与默认的未连接UDP套接字相比，发生了三个变化。
+
+**(1)我们再也不能给输出操作指定目的IP地址和端口号。**也就是说，我们不使用sendto,而改用write或send。写到已连接UDP套接字上的任何内容都自动发送到由connect指定的协议地址 (如IP地址和端口号)。
+
+**(2)我们不必使用recvfrom以获悉数据报的发送者，而改用read、recv或recvmsg**。在一个已连接UDP套接字上，由内核为输入操作返回的数据报只有那些来自connect所指定协议地址的数据报。目的地为这个已连接UDP套接字的本地协议地址(如IP地址和端口号)，发源地却不是该套接字早先connect到的协议地址的数据报，不会投递到该套接字。**这样就限制一个已连接UDP套接字能且仅能与一个对端交换数据报。**
+
+**(3)由已连接UDP套接字引发的异步错误会返回给它们所在的进程，而未连接UDP套接字不接收任何异步错误。**
+
+![image-20230707192703709](UNIX网络编程：套接字概念、TCP与UDP编程模型.assets/image-20230707192703709.png)
+
+如上图,应用进程先调用connect指定对端IP和端口号,然后使用read和write函数与对端交换数据。
+
+来自其他IP地址或端口的数据报不投递给这个已连接套接字,因为它们要么源IP地址要么源UDP端口不与该套接字connect到的协议地址相匹配。这些数据报可能投递给同一主机上的其他某UDP套接字,如果没有相匹配的套接字,UDP将丢弃它们,并返回ICMP端口不可达错误。
+
+作为小结,我们可以说UDP客户进程或服务器进程只有在自己的UDP套接字与确定的唯一端进行通信时,才调用connect。调用connect的通常是UDP客户,但有些网络应用中UDP服务器会与单个客户长时间通信(如TFTP),此时客户和服务器都可能调用connect。
+
+通常通过在`/etc/resolv.conf` 文件中列出服务器主机的IP地址,一个DNS客户主机就能被配置成使用一个或多个DNS服务器。如果列出的是单个服务器主机(图中最左边的方框),客户进程就可以调用connect ,但是如果列出的是多个服务器主机(图中从右边数第二个方框),客户进程就不能调用connect 。另外DNS服务器进程通常是处理客户请求的,因此服务器进程不能调用connect 。
+
+#### 给一个UDP套接字多次调用connect
+
+拥有一个已连接UDP套接字的进程可出于下列两个目的之一再次调用connect : 
+
+- 指定新的IP地址和端口号; 
+- 断开套接字。
+
+第一个目的(即给一个已连接UDP套接字指定新的对端)不同于TCP套接字中connect 的使用:对于TCP套接字,connect 只能调用一次。
+
+为了断开一个已连接UDP套接字,我们再次调用connect 时把套接字地址结构的地址族成员(对于IPv4为sin_family ,对于IPv6为sin6_family )设置为AF_UNSPEC 。这么做可能会返回一个EAFNOSUPPORT 错误，不过没有关系。使套接字断开连接的是在已连接UDP套接字上调用connect 的进程。
+
+#### 性能
+
+当应用程序在未连接的UDP套接字上调用sendto发送数据报时，内核会暂时连接该套接字，发送数据报，然后断开连接。如果应用程序需要发送多个数据报到同一个目的地址，显式连接套接字的效率更高。这样只需要连接一次，然后可以多次调用write输出数据报。如果使用临时连接的方式，每次调用sendto都需要连接和断开连接，会耗费相当大的开销。此外，第一次临时连接需要搜索路由表并缓存路由信息，但第二次临时连接可以直接使用缓存的路由信息，避免了重复搜索路由表的开销。
+
+### dg_cli函数(修订版)
+
+将dg_cli函数重写为使用connect调用，并用read和write调用代替sendto和recvfrom调用。由于该函数不查看传递给connect的套接字地址结构的内容，因此仍然是协议无关的。当我们在macosx主机上运行该程序并指定一个没有运行服务器程序的主机时，调用connect将返回一个连接被拒绝的错误。这是因为调用connect会导致UDP三路握手，其中第一个分节会导致服务器主机返回一个ICMP错误消息。大多数源自Berkeley的内核都能正确处理这种情况，但有些System V内核则不行。例如，在Solaris 2.4主机上运行同一个程序时，客户的read调用可能永远不会返回。这个问题已经在Solaris 2.5中得到了解决，而AIX、Digital Unix、HP-UX和Linux都能正确处理这种情况。
+
+### UDP缺乏流量控制
+
+**实验证明：没有流量控制的UDP会丢失数据:**客户发出2000个数据报,但是服务器只收到其中的30个,丢失率为98%。对于服务器应用进程或客户应用进程都没有给出任何指示说这些数据报已丢失。**这证实了我们说过的话,即UDP没有流量控制并且是不可靠的。**本例表明UDP发送端淹没其接收端是轻而易举之事。
+数据丢失的原因:**因为接收套接字的接收队列(套接字缓存区)已满而而将数据报丢弃** 如果我们再次运行相同的客户和服务器,不过这一次**让客户运行在慢速的Sun主机上**,**让服务器运行在较快的RS/6000主机上,那就没有数据报丢失。**
+
+UDP套接字接收缓冲区:由UDP给某个特定套接字排队的UDP数据报数目受限于该接字接收缓冲区的大小。如果我们增大套接字接收缓冲区的大小,那么服务器有望接收更多的数据报。
+
+### UDP中的外出接口的确定
+
+已连接UDP套接字还可用来确定用于某个特定目的地的外出接口。这是由connect 函数应用到UDP套接字时的一个副作用造成的: 内核选择本地IP地址(假设其进程未曾调用bind 显式指派它)。这个本地IP地址通过为目的IP地址搜索路由表得到外出接口,然后选用该接口的主IP地址而选定。
+
+#### 使用select函数的TCP和UDP回射服务器程序
+
+```
+#include "unp.h"
+
+int main(int argc, char **argv) {
+    int listenfd, connfd, udpfd, nready, maxfdp1;
+    char mesg[MAXLINE];
+    pid_t childpid;
+    fd_set rset;
+    ssize_t n;
+    socklen_t len;
+    const int on = 1;
+    struct sockaddr_in cliaddr, servaddr;
+    void sig_chld(int);
+
+    /* create listening TCP socket */
+    listenfd = Socket(AF_INET, SOCK_STREAM, 0);
+
+    bzero(&servaddr, sizeof(servaddr));
+    servaddr.sin_family = AF_INET;
+    servaddr.sin_addr.s_addr = htonl(INADDR_ANY);
+    servaddr.sin_port = htons(SERV_PORT);
+
+    // 设置SO_REUSEADDR，防止该端口上已有连接存在
+    Setsockopt(listenfd, SOL_SOCKET, SO_REUSEADDR, &on, sizeof(on));
+    Bind(listenfd, (SA *)&servaddr, sizeof(servaddr));
+
+    Listen(listenfd, LISTENQ);
+
+    /* create UDP socket */
+    // 此处不用设置SO_REUSEADDR选项，因为UDP端口和TCP端口是相互独立的
+    udpfd = Socket(AF_INET, SOCK_DGRAM, 0);
+
+    bzero(&servaddr, sizeof(servaddr));
+    servaddr.sin_family = AF_INET;
+    servaddr.sin_addr.s_addr = htonl(INADDR_ANY);
+    servaddr.sin_port = htons(SERV_PORT);
+
+    Bind(udpfd, (SA *)&servaddr, sizeof(servaddr));
+
+    Signal(SIGCHLD, sig_chld);    /* must call waitpid */
+
+    FD_ZERO(&rset);
+    maxfdp1 = max(listenfd, udpfd) + 1;
+    for (; ;) {
+        FD_SET(listenfd, &rset);
+		FD_SET(udpfd, &rset);
+		if ((nready = select(maxfdp1, &rset, NULL, NULL, NULL)) < 0) {
+		    // 对SIGCHLD信号的处理可能会中断select函数
+		    if (errno == EINTR) {
+		        continue;
+		    } else {
+		        err_sys("select error");
+		    }
+		}
+	
+		if (FD_ISSET(listenfd, &rset)) {
+		    len = sizeof(cliaddr);
+		    connfd = Accept(listenfd, (SA *)&cliaddr, &len);
+	
+		    if ((childpid = Fork()) == 0) {    /* child process */
+		        Close(listenfd);    /* close listening socket */
+				str_echo(connfd);    /* process the request */
+				exit(0);
+		    }
+		    Close(connfd);    /* parten closes connected socket */
+		}
+	
+		if (FD_ISSET(udpfd, &rset)) {
+		    len = sizeof(cliaddr);
+		    n = Recvfrom(udpfd, mesg, MAXLINE, 0, (SA *)&cliaddr, &len);
+	
+		    Sendto(udpfd, mesg, n, 0, (SA *)&cliaddr, len);
+		}
+    }
+}
+
+```
+
+**创建监听TCP套接字** **14~22** 创建一个监听TCP套接字并捆绑服务器的众所周知端口，设置SO_REUSEADDR套接字选项以防该端口上已有连接存在。 
+
+**创建UDP套接字** **23~29** 还创建一个UDP套接字并捆绑与TCP套接字相同的端口。这里无需在调用bind之前设置SOREUSEADDR套接字选项，因为TCP端口是独立于UDP端口的。
+
+**给SIGCHLD建立信号处理程序** **30**        给SIGCHLD建立信号处理程序，因为TCP连接将由某个子进程处理。我们已在(图5-11)中给出了这个信号处理函数。
+
+ **准备调用select** **31~32** 我们给select初始化一个描述符集，并计算出我们等待的两个描述符的较大者
+
+**调用select** **34~41** 我们调用select只是为了等待监听TCP套接字的可读条件或UDP套接字的可读条件。既然我们的sig_chld信号处理函数可能中断我们对select的调用，我们于是需要处理EINTR错误。
+
+ **处理新的客户连接** **42~51** 当监听TCP套接字可读时，我们accept一个新的客户连接，fork一个子进程，并在子进程中调用str_echo函数。这与第5章中采取的步骤相同。
+
+**处理数据报的到达** **52~57** 如果UDP套接字可读，那么已有一个数据报到达。我们使用recvfrom读入它，再使用sendto把它发回给客户。
+
+### 小结
+
+把TCP回射客户/服务器程序转换成UDP回射客户/服务器程序比较容易,然而TCP提供的许多功能也消失了:检测丢失的分组并重传,验证响应是否来自正确的对端等。
+
+264 UDP套接字可能产生异步错误,它们是在分组发送完一段时间后才报告的错误。TCP套接字总是给应用进程报告这些错误,但是UDP 套接字必须已连接才能接收这些错误。
+
+UDP没有流量控制,这一点很容易演示证明。一般来说,这不成什么问题,因为许多UDP应用程序是用请求-应答模式构造的,而且不用于传送大量数据。
